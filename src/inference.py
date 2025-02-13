@@ -7,7 +7,7 @@ from src.utils.feature_extract import extract_features
 from src.model import ChorusMLP
 
 # 1. 定义并加载模型
-model = ChorusMLP(input_dim=13, hidden_size=32, output_dim=2)
+model = ChorusMLP(input_dim=13, hidden_size=16, output_dim=2)
 model.load_state_dict(torch.load(MODEL_PATH))
 model.eval()
 
