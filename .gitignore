@@ -1,0 +1,24 @@
+# Python相关
+__pycache__/
+*.py[cod]
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints
+
+# 环境或IDE
+venv/
+.env/
+.idea/
+
+# 模型和大文件
+saved_models/
+*.pt
+*.h5
+
+# 其他临时文件
+temp_*
