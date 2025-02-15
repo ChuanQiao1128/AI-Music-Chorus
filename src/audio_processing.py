@@ -1,47 +1,89 @@
-from pydub import AudioSegment
-from src.inference import detect_chorus
+"""
+audio_processing.py
+-------------------
+提供音频处理的实用函数:
+  - load_audio: 加载音频文件 => (np.ndarray, sr)
+  - save_audio_segment: 将 [start,end] 秒的音频写入文件
+  - get_high_energy_segment: 返回长为 segment_duration (秒) 的音频里能量最大的起始时间
 
-def extract_audio_segment(input_file, start_time, end_time, output_file=None):
-    """
-    从 input_file 中提取 [start_time, end_time] (秒) 的片段.
-    可导出到 output_file (mp3)
-    """
-    audio = AudioSegment.from_file(input_file)
-    excerpt = audio[start_time * 1000 : end_time * 1000]  # 毫秒切片
-    if output_file:
-        excerpt.export(output_file, format="mp3")
-        return output_file
-    else:
-        return excerpt
+被 test_save_audio_segment、inference.py 等调用
+"""
 
-def merge_audio_segments(segments, output_file="merged.mp3"):
-    """
-    合并多个 AudioSegment 并导出mp3
-    """
-    merged = AudioSegment.empty()
-    for seg in segments:
-        merged += seg
-    merged.export(output_file, format="mp3")
-    return output_file
+import os
+import logging
+import librosa
+import numpy as np
+import soundfile as sf
 
-def extract_chorus(input_file, output_file=None):
+def load_audio(file_path: str, sr: int=22050):
     """
-    只提取该歌曲第一段副歌。
+    加载音频文件(支持常见格式: WAV, MP3等), 返回: (audio_data, sample_rate)
+    audio_data 为 单声道 np.float32 array
+    sr 为采样率
     """
-    chorus_segments = detect_chorus(input_file)
-    if not chorus_segments:
-        print("未检测到副歌段落，返回空AudioSegment")
-        return AudioSegment.empty()
+    if not os.path.exists(file_path):
+        raise ValueError(f"File not found: {file_path}")
+    try:
+        # mono=True => librosa会自动混合到单声道
+        audio_data, sample_rate = librosa.load(file_path, sr=sr, mono=True)
+        logging.debug(f"Loaded audio: {file_path}, sr={sample_rate}, length={len(audio_data)/sample_rate:.2f}s")
+        return audio_data, sample_rate
+    except Exception as e:
+        logging.error(f"Failed to load audio '{file_path}': {e}")
+        raise ValueError(f"Could not load audio file: {e}")
 
-    # 只要第一段
-    (start_sec, end_sec) = chorus_segments[0]
-    print(f"[extract_chorus] 第1段副歌 => {start_sec:.1f}s ~ {end_sec:.1f}s")
+def save_audio_segment(audio_data: np.ndarray, sr: int,
+                       start_time: float, end_time: float,
+                       output_file: str):
+    """
+    将 audio_data 数组里 [start_time, end_time] 的片段写到 output_file (WAV等格式).
+    这里示例写成 WAV, 你也可用 soundfile 写 FLAC, etc.
 
-    audio = AudioSegment.from_file(input_file)
-    final_chorus = audio[start_sec*1000 : end_sec*1000]
+    :param audio_data: shape=(samples,) 的np数组
+    :param sr: 采样率
+    :param start_time: 片段开始(秒)
+    :param end_time: 片段结束(秒)
+    :param output_file: 输出文件路径(如 .wav)
+    """
+    if start_time<0 or end_time<= start_time:
+        raise ValueError(f"Invalid start/end time: {start_time}~{end_time}")
+    total_sec= len(audio_data)/ sr
+    if start_time >= total_sec:
+        raise ValueError("start_time >= total audio duration, no segment to save.")
+    # clamp
+    end_time= min(end_time, total_sec)
+    start_idx= int(start_time * sr)
+    end_idx= int(end_time   * sr)
+    segment= audio_data[start_idx:end_idx]
 
-    if output_file:
-        final_chorus.export(output_file, format="mp3")
-        return output_file
-    else:
-        return final_chorus
+    try:
+        sf.write(output_file, segment, sr, subtype='PCM_16')
+        logging.info(f"Saved audio segment => {output_file}, duration={end_time-start_time:.2f}s")
+    except Exception as e:
+        logging.error(f"Failed saving segment to {output_file}: {e}")
+        raise
+
+def get_high_energy_segment(audio_data: np.ndarray, sr: int,
+                            segment_duration: float=15.0) -> float:
+    """
+    返回音频中长度= segment_duration (秒) 的「能量最高」窗口的起始时间(秒).
+    如果音频长 < segment_duration, 返回0.0
+    """
+    total_len= len(audio_data)/ sr
+    if total_len<= segment_duration:
+        return 0.0
+    seg_samples= int(segment_duration * sr)
+    # 计算能量(平方和)
+    squared= audio_data**2
+    cumsum= np.concatenate(([0.0], np.cumsum(squared)))
+    best_energy= -1.0
+    best_start_smpl= 0
+    step= sr  # 1秒步长
+    max_start= len(audio_data)- seg_samples
+    for start_smpl in range(0, max_start+1, step):
+        end_smpl= start_smpl+ seg_samples
+        energy= cumsum[end_smpl]- cumsum[start_smpl]
+        if energy> best_energy:
+            best_energy= energy
+            best_start_smpl= start_smpl
+    return best_start_smpl/ sr

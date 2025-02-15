@@ -14,7 +14,7 @@ import time
 def test_api_chorus_segments():
     # 假设后端运行在 localhost:8000
     url = "http://127.0.0.1:8000/song/segments"
-    test_file = os.path.abspath("tests/test_sample.mp3")
+    test_file = os.path.abspath("tests/test_sample_01.mp3")
     if not os.path.exists(test_file):
         pytest.skip("测试音频文件不存在")
 

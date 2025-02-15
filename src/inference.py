@@ -1,118 +1,122 @@
-import torch
-import librosa
+"""
+inference.py
+------------
+核心: detect_chorus(...) => 若无满足threshold的重复段 => fallback => get_high_energy_segment
+"""
+
 import numpy as np
+import logging
+import librosa
+from dataclasses import dataclass
+from typing import Optional
 
-from src.config import AUDIO_SAMPLE_RATE, MODEL_PATH
-from src.utils.feature_extract import extract_features
-from src.model import ChorusMLP
+from src.audio_processing import get_high_energy_segment
 
-# 1. 定义并加载模型
-model = ChorusMLP(input_dim=13, hidden_size=16, output_dim=2)
-model.load_state_dict(torch.load(MODEL_PATH))
-model.eval()
+@dataclass
+class ChorusSegment:
+    start: float
+    end: float
+    confidence: Optional[float]= None
+    is_fallback: bool= False
 
+    @property
+    def duration(self)->float:
+        return self.end- self.start
 
 def detect_chorus(
-        audio_file_path,
-        frame_size=1.0,
-        min_chorus_len=5.0,
-        max_chorus_len=None,
-        merge_gap=3.0
-):
+    audio_data: np.ndarray,
+    sr: int,
+    min_duration: float=15.0,
+    max_duration: float=30.0,
+    threshold: float=0.7
+)-> ChorusSegment:
     """
-    对给定音频文件进行副歌检测，返回一个[(chorus_start, chorus_end), ...]列表.
-
-    主要优化逻辑:
-      1. 每帧做二分类 (0 or 1)，若全为0则插入一个伪副歌.
-      2. 副歌段长度若低于 min_chorus_len 则丢弃.
-      3. 如果 max_chorus_len 不为 None, 超过则截断/限制.
-      4. 支持合并相邻副歌段(间隔< merge_gap 秒).
-
-    :param audio_file_path: mp3/wav文件路径
-    :param frame_size: 每帧长度(秒), 默认1.0 => 1秒一帧
-    :param min_chorus_len: 副歌段的最短阈值(秒). 如果小于此长度则认为无效
-    :param max_chorus_len: 副歌段的最大长度(秒). 如果不为None则超出时截断
-    :param merge_gap: 若两个副歌段之间空隙< merge_gap, 则合并
-    :return: 副歌区间列表 [ (start_sec, end_sec), ... ]
+    检测副歌, 若找不到重复段则fallback => get_high_energy_segment
     """
-    # 1. 读取音频 & 提取特征
-    y, sr = librosa.load(audio_file_path, sr=AUDIO_SAMPLE_RATE)
-    segments_features = extract_features(y, sr, frame_size=frame_size)
 
-    label_sequence = []
-    time_sequence = []
-    current_time = 0.0
+    if min_duration< 15.0:
+        logging.warning(f"Given min_duration={min_duration}, forcing to 15.0")
+        min_duration= 15.0
+    if max_duration< min_duration:
+        max_duration= min_duration
 
-    # 2. 模型推理（对每帧做二分类）
-    for feat in segments_features:
-        input_tensor = torch.tensor(feat, dtype=torch.float32).unsqueeze(0)
-        with torch.no_grad():
-            output = model(input_tensor)  # shape: (1,2)
-            pred_label = torch.argmax(output, dim=1).item()  # 0 or 1
-        label_sequence.append(pred_label)
-        time_sequence.append(current_time)
-        current_time += frame_size
+    total_duration= len(audio_data)/ sr if len(audio_data)>0 else 0.0
+    if total_duration<=0:
+        raise ValueError("audio_data is empty.")
 
-    total_time = current_time
+    # 若音频 <= max_duration => 整首 fallback
+    if total_duration<= max_duration:
+        logging.info(f"Short track {total_duration:.2f}s <= {max_duration:.2f}, entire track as chorus.")
+        return ChorusSegment(0.0, total_duration, None, True)
 
-    # 3. 若全为0，插入伪副歌
-    if all(lbl == 0 for lbl in label_sequence):
-        print(f"[detect_chorus] 预测结果全是0, 人为插入伪副歌. total_time={total_time:.1f}s")
-        label_sequence = [0] * len(label_sequence)
-        # 示例: 如果 >= 90s => 插入[60,90], 否则插入[10, 50]
-        if total_time >= 90:
-            start_fake, end_fake = 60.0, 90.0
+    # 计算 chroma => 找重复(如cosine相似)
+    try:
+        hop_length= 1024
+        chroma= librosa.feature.chroma_stft(y=audio_data, sr=sr, hop_length=hop_length)
+    except Exception as e:
+        logging.error(f"Failed to compute chroma: {e}, fallback => high energy.")
+        # fallback
+        if total_duration> min_duration:
+            s= get_high_energy_segment(audio_data, sr, min_duration)
         else:
-            start_fake, end_fake = 10.0, min(10.0 + 40.0, total_time)
+            s=0.0
+        e= min(s+ min_duration, total_duration)
+        return ChorusSegment(s,e,None, True)
 
-        # 对应帧设为1
-        start_idx = int(start_fake / frame_size)
-        end_idx = int(end_fake / frame_size)
-        for i in range(start_idx, min(end_idx, len(label_sequence))):
-            label_sequence[i] = 1
+    num_frames= chroma.shape[1]
+    frames_per_sec= sr/ float(hop_length)
+    min_frames= int(min_duration* frames_per_sec)
+    if min_frames<1:
+        min_frames=1
 
-    # 4. 合并连续为1的帧 => (start_sec, end_sec)
-    raw_segments = []
-    start = None
-    for i, lbl in enumerate(label_sequence):
-        if lbl == 1 and start is None:
-            start = time_sequence[i]
-        elif lbl == 0 and start is not None:
-            end = time_sequence[i]
-            raw_segments.append((start, end))
-            start = None
-    # 若结尾仍在副歌
-    if start is not None:
-        raw_segments.append((start, total_time))
+    best_sim= 0.0
+    best_i= 0
+    best_j= 0
 
-    # 5. 过滤过短段/截断过长段
-    filtered_segments = []
-    for (s, e) in raw_segments:
-        dur = e - s
-        if dur < min_chorus_len:
+    step_frames= int(frames_per_sec) #1秒粒度
+    for i in range(0, num_frames- min_frames+1, step_frames):
+        seg_i= chroma[:, i:i+min_frames]
+        if seg_i.shape[1]< min_frames:
             continue
-        if max_chorus_len is not None and dur > max_chorus_len:
-            e = s + max_chorus_len
-        filtered_segments.append((s, e))
+        vec_i= seg_i.flatten()
+        norm_i= np.linalg.norm(vec_i)
+        if norm_i==0:
+            continue
+        for j in range(i+ min_frames, num_frames- min_frames+1, step_frames):
+            seg_j= chroma[:, j:j+ min_frames]
+            if seg_j.shape[1]< min_frames:
+                continue
+            vec_j= seg_j.flatten()
+            norm_j= np.linalg.norm(vec_j)
+            if norm_j==0:
+                continue
+            sim= np.dot(vec_i, vec_j)/(norm_i*norm_j)
+            if sim> best_sim:
+                best_sim= sim
+                best_i= i
+                best_j= j
+                logging.debug(f"Found new best sim={best_sim:.3f}, i={i}, j={j}")
+                if best_sim>=0.9999:
+                    break
+        if best_sim>=0.9999:
+            break
 
-    # 6. 合并相邻段(若间隔< merge_gap)
-    merged_segments = []
-    if not filtered_segments:
-        return merged_segments
-    # 先按照起始时间排序
-    filtered_segments.sort(key=lambda seg: seg[0])
-    curr_start, curr_end = filtered_segments[0]
-    for i in range(1, len(filtered_segments)):
-        nxt_start, nxt_end = filtered_segments[i]
-        # 若下一个段的开始 与 当前段的结束 之间的间隔 < merge_gap => 合并
-        if nxt_start - curr_end <= merge_gap:
-            # 合并 => 取更大的end
-            curr_end = max(curr_end, nxt_end)
-        else:
-            # 不合并,先把前一个放进数组,再更新
-            merged_segments.append((curr_start, curr_end))
-            curr_start, curr_end = nxt_start, nxt_end
-    # 把最后一段放进
-    merged_segments.append((curr_start, curr_end))
-
-    return merged_segments
+    if best_sim>= threshold:
+        # 找到重复
+        frame_dur=1.0/ frames_per_sec
+        seg_start= best_i* frame_dur
+        seg_end  = seg_start+ min_duration
+        seg_len  = seg_end- seg_start
+        if seg_len> max_duration:
+            seg_end= seg_start+ max_duration
+            seg_len= max_duration
+        logging.info(f"Chorus detected (repeated segment) conf={best_sim:.3f}")
+        return ChorusSegment(seg_start, seg_end, best_sim, False)
+    else:
+        # fallback
+        logging.info(f"No repeated segment above threshold={threshold:.3f}, fallback => high energy")
+        s= get_high_energy_segment(audio_data, sr, min_duration)
+        e= s+ min_duration
+        if e> total_duration:
+            e= total_duration
+        return ChorusSegment(s,e,None, True)

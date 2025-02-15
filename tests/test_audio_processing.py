@@ -1,47 +1,49 @@
-import pytest
+# audio_processing.py
+import logging
 import os
-import sys
 from pydub import AudioSegment
+from src.inference import detect_chorus, ChorusSegment
+from src.audio_processing import load_audio  # 如果你需要加载文件
 
-# 保证能找到 src/
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../src')))
+def extract_chorus_list_and_merge(song_list, output_file="mega_chorus.mp3"):
+    """
+    对 song_list 中的每首歌:
+      1) 检测副歌
+      2) 打印/记录该首歌的副歌区间
+      3) 拼接到 merged
+    最后导出到 output_file, 并打印合并后的大小/时长
+    """
+    merged = AudioSegment.empty()
+    for idx, song_file in enumerate(song_list):
+        logging.info(f"[extract_chorus_list_and_merge] Processing Song #{idx+1}: {song_file}")
 
-from src.audio_processing import (
-    extract_audio_segment,
-    merge_audio_segments,
-    extract_chorus
-)
+        # 1) 加载音频 => audio_data, sr
+        audio_data, sr = load_audio(song_file)
+        # 2) detect_chorus => ChorusSegment
+        segment: ChorusSegment = detect_chorus(audio_data, sr)
+        dur = segment.duration
+        fallback_str = " (fallback)" if segment.is_fallback else ""
+        conf_str = f"{segment.confidence:.2f}" if segment.confidence is not None else "N/A"
 
-def test_extract_audio_segment():
-    test_file = "tests/test_sample.mp3"
-    if not os.path.exists(test_file):
-        pytest.skip("测试音频文件不存在，跳过测试。")
+        logging.info(f"[Song#{idx+1}] {song_file} => start={segment.start:.2f}s, end={segment.end:.2f}s, "
+                     f"duration={dur:.2f}s, conf={conf_str}{fallback_str}")
 
-    out_file = "tests/test_segment.mp3"
-    extract_audio_segment(test_file, 0, 5, out_file)
-    assert os.path.exists(out_file), "没有生成切割文件"
-    os.remove(out_file)
+        # 用pydub再从文件中裁剪(如果你想精确操作, 需再 load_audio => pydubAudioSegment)
+        whole_audio = AudioSegment.from_file(song_file)
+        start_ms = int(segment.start * 1000)
+        end_ms = int(segment.end * 1000)
+        chorus_part = whole_audio[start_ms:end_ms]
 
-def test_merge_audio_segments():
-    seg1 = AudioSegment.silent(duration=1000)  # 1s静音
-    seg2 = AudioSegment.silent(duration=2000)  # 2s静音
-    out_file = "tests/merged_test.mp3"
-    merge_audio_segments([seg1, seg2], out_file)
-    assert os.path.exists(out_file), "没有生成合并文件"
-    os.remove(out_file)
+        # 3) 拼到 merged
+        if len(chorus_part) > 0:
+            merged += chorus_part
+        else:
+            logging.warning(f"[Song#{idx+1}] Empty chorus segment from {song_file}?")
 
-def test_extract_chorus():
-    test_file = "tests/test_sample.mp3"
-    if not os.path.exists(test_file):
-        pytest.skip("测试音频文件不存在，跳过测试。")
+    # 4) 导出合并结果
+    merged.export(output_file, format="mp3")
+    merged_dur_sec = len(merged) / 1000.0
+    file_size = os.path.getsize(output_file) if os.path.exists(output_file) else 0
+    logging.info(f"[extract_chorus_list_and_merge] Merged => {output_file}, duration={merged_dur_sec:.2f}s, size={file_size} bytes")
 
-    out_file = "tests/test_chorus.mp3"
-    result_path = extract_chorus(test_file, out_file)
-
-    assert os.path.exists(out_file), "副歌提取文件未生成"
-
-    chorus_audio = AudioSegment.from_file(out_file)
-    assert len(chorus_audio) > 0, "提取的副歌时长为0"
-
-    # 如需清理可取消注释
-    # os.remove(out_file)
+    return output_file
